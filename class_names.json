@@ -1,0 +1,19 @@
+{
+  "class_names": [
+    "akiec",
+    "bcc",
+    "bkl",
+    "nv",
+    "mel"
+  ],
+  "class_labels": {
+    "akiec": "Actinic keratoses",
+    "bcc": "Basal cell carcinoma",
+    "bkl": "Benign keratosis-like lesions ",
+    "nv": "Melanocytic nevi",
+    "mel": "Melanoma"
+  },
+  "img_size": 300,
+  "num_classes": 5,
+  "best_val_accuracy": 0.9365808823529411
+}
