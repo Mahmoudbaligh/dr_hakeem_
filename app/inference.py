@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 # ============================================================
-# IMPORTANT:
-# Set CPU-related env vars BEFORE importing torch.
-# This helps reduce CPU thread/memory pressure on Railway.
+# CPU / THREAD SETTINGS
+# Must be set before importing torch.
 # ============================================================
 
 import os
@@ -26,6 +25,12 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    torch.backends.nnpack.enabled = False
+except Exception:
+    pass
+
 from torchvision import models, transforms
 
 import onnxruntime as ort
@@ -55,20 +60,23 @@ MAX_IMAGE_PIXELS = 20_000_000            # 20 MP
 # ------------------------------------------------------------
 # OOD / rejection thresholds
 # ------------------------------------------------------------
+
 MIN_CONFIDENCE = 0.70
 MIN_MARGIN = 0.15
 MAX_ENTROPY = 0.85
 
 # ------------------------------------------------------------
-# Grad-CAM
+# Grad-CAM overlay
 # ------------------------------------------------------------
+
 DEFAULT_ALPHA = 0.45
 MAX_ALPHA = 0.85
 MIN_ALPHA = 0.10
 
 # ------------------------------------------------------------
-# Threading
+# CPU threading
 # ------------------------------------------------------------
+
 try:
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
@@ -136,6 +144,7 @@ def load_class_config() -> None:
     global CLASSES
     global LABELS
     global NUM_CLASSES
+    global IMG_SIZE
 
     if not CLASS_NAMES_PATH.exists():
         print("[WARN] class_names.json not found. Using defaults.")
@@ -160,7 +169,6 @@ def load_class_config() -> None:
             }
 
         if isinstance(img_size, int) and img_size > 0:
-            global IMG_SIZE
             IMG_SIZE = img_size
 
         NUM_CLASSES = len(CLASSES)
@@ -190,7 +198,10 @@ load_class_config()
 
 PYTORCH_TRANSFORM = transforms.Compose(
     [
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.Resize(
+            (IMG_SIZE, IMG_SIZE),
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        ),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=IMAGE_MEAN,
@@ -221,8 +232,8 @@ ONNX_INPUT_NAME: str | None = None
 
 def load_onnx_model() -> None:
     """
-    Loads the ONNX model once.
-    ONNX is used for /predict because it is lighter and faster.
+    Loads the ONNX model lazily.
+    ONNX is used only for /predict.
     """
 
     global ONNX_SESSION
@@ -239,7 +250,6 @@ def load_onnx_model() -> None:
     print(f"[INFO] Loading ONNX model: {ONNX_MODEL_PATH}")
 
     session_options = ort.SessionOptions()
-
     session_options.intra_op_num_threads = 1
     session_options.inter_op_num_threads = 1
     session_options.graph_optimization_level = (
@@ -271,7 +281,20 @@ def load_onnx_model() -> None:
     )
 
 
-load_onnx_model()
+def unload_onnx_model() -> None:
+    """
+    Releases ONNX Runtime session.
+    This prevents ONNX + PyTorch from occupying RAM together
+    during /explain.
+    """
+
+    global ONNX_SESSION
+    global ONNX_INPUT_NAME
+
+    ONNX_SESSION = None
+    ONNX_INPUT_NAME = None
+
+    gc.collect()
 
 
 # ============================================================
@@ -280,7 +303,7 @@ load_onnx_model()
 
 PYTORCH_MODEL: nn.Module | None = None
 
-# Only one Grad-CAM request is processed at a time.
+# Only one Grad-CAM request at a time.
 PYTORCH_MODEL_LOCK = threading.RLock()
 
 
@@ -288,7 +311,9 @@ PYTORCH_MODEL_LOCK = threading.RLock()
 # CHECKPOINT HELPERS
 # ============================================================
 
-def _extract_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
+def _extract_state_dict(
+    checkpoint: Any,
+) -> dict[str, torch.Tensor]:
     """
     Supports:
       - raw state_dict
@@ -343,24 +368,19 @@ def _checkpoint_uses_nested_classifier(
     state_dict: dict[str, torch.Tensor],
 ) -> bool:
     """
-    Detects whether the trained checkpoint uses:
+    Detects whether the trained checkpoint uses a nested
+    classifier:
 
-        classifier:
-            Sequential(
-                Dropout,
-                Sequential(
-                    Dropout,
-                    Linear(...)
-                )
-            )
-
-    or the normal torchvision form:
-
-        classifier:
+        classifier.1:
             Sequential(
                 Dropout,
                 Linear(...)
             )
+
+    versus the normal torchvision form:
+
+        classifier.1:
+            Linear(...)
     """
 
     nested_weight_keys = (
@@ -440,7 +460,6 @@ def load_pytorch_model() -> nn.Module:
 
     print("[INFO] Loading PyTorch Grad-CAM model...")
 
-    # Safe loading for a state-dict checkpoint.
     checkpoint = torch.load(
         str(PYTORCH_MODEL_PATH),
         map_location="cpu",
@@ -461,16 +480,13 @@ def load_pytorch_model() -> nn.Module:
     model = build_pytorch_model(state_dict)
 
     # Strict loading is intentional.
-    # We don't want to silently run Grad-CAM with random weights.
+    # Never run Grad-CAM with random / partially loaded weights.
     try:
-
         model.load_state_dict(
             state_dict,
             strict=True,
         )
-
     except RuntimeError as e:
-
         raise RuntimeError(
             "PyTorch checkpoint does not exactly match "
             "the EfficientNet-B3 architecture.\n"
@@ -480,8 +496,8 @@ def load_pytorch_model() -> nn.Module:
     model.eval()
     model.to(DEVICE)
 
-    # We don't need parameter gradients.
-    # Grad-CAM only needs gradients through activations.
+    # Grad-CAM implementation below does not require parameter
+    # gradients. We use a detached activation map instead.
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
@@ -501,7 +517,7 @@ def load_pytorch_model() -> nn.Module:
 
 def unload_pytorch_model() -> None:
     """
-    Releases PyTorch model and CPU memory.
+    Releases PyTorch model and memory.
     """
 
     global PYTORCH_MODEL
@@ -525,7 +541,12 @@ def load_image(
     image_bytes: bytes,
 ) -> Image.Image:
     """
-    Validates and loads image without saving it to disk.
+    Validates and loads the image.
+
+    IMPORTANT:
+    The original phone image can be 3072x3072 or larger.
+    We resize it immediately to IMG_SIZE x IMG_SIZE to
+    avoid carrying a huge PIL image through /explain.
     """
 
     if not image_bytes:
@@ -548,9 +569,7 @@ def load_image(
             io.BytesIO(image_bytes)
         ) as image:
 
-            rgb = image.convert("RGB")
-
-            width, height = rgb.size
+            width, height = image.size
 
             if width <= 0 or height <= 0:
                 raise ValueError(
@@ -562,11 +581,15 @@ def load_image(
                     "Image has too many pixels."
                 )
 
-            # Copy so the underlying BytesIO/Image handle
-            # is no longer required.
-            rgb = rgb.copy()
+            rgb = image.convert("RGB")
 
-        return rgb
+            # Resize immediately to model resolution.
+            rgb = rgb.resize(
+                (IMG_SIZE, IMG_SIZE),
+                Image.Resampling.BILINEAR,
+            )
+
+            return rgb.copy()
 
     except ValueError:
         raise
@@ -633,6 +656,9 @@ def image_to_pytorch_tensor(
     """
     Converts image to PyTorch tensor:
         [1, 3, H, W]
+
+    No requires_grad is needed because the memory-efficient
+    Grad-CAM implementation uses a forward activation map only.
     """
 
     tensor = PYTORCH_TRANSFORM(image)
@@ -643,9 +669,6 @@ def image_to_pytorch_tensor(
         DEVICE,
         non_blocking=False,
     )
-
-    # Required for backward/Grad-CAM while parameters stay frozen.
-    tensor.requires_grad_(True)
 
     return tensor
 
@@ -720,11 +743,16 @@ def calculate_metrics(
         sorted_probs[0]
     )
 
-    second_probability = float(
-        sorted_probs[1]
-    ) if len(sorted_probs) > 1 else 0.0
+    second_probability = (
+        float(sorted_probs[1])
+        if len(sorted_probs) > 1
+        else 0.0
+    )
 
-    margin = confidence - second_probability
+    margin = (
+        confidence
+        - second_probability
+    )
 
     entropy = -np.sum(
         probs * np.log(
@@ -737,8 +765,9 @@ def calculate_metrics(
     )
 
     if len(probs) > 1:
-        normalized_entropy = entropy / np.log(
-            len(probs)
+        normalized_entropy = (
+            entropy
+            / np.log(len(probs))
         )
     else:
         normalized_entropy = 0.0
@@ -778,11 +807,18 @@ def build_success_result(
     Creates the standard prediction response.
     """
 
-    best_index, confidence, margin, entropy = (
-        calculate_metrics(probabilities)
+    (
+        best_index,
+        confidence,
+        _margin,
+        _entropy,
+    ) = calculate_metrics(
+        probabilities
     )
 
-    predicted_class = CLASSES[best_index]
+    predicted_class = CLASSES[
+        best_index
+    ]
 
     return {
         "status": "success",
@@ -803,11 +839,18 @@ def build_rejection_result(
     Creates object_not_defined response.
     """
 
-    best_index, confidence, margin, entropy = (
-        calculate_metrics(probabilities)
+    (
+        best_index,
+        confidence,
+        margin,
+        entropy,
+    ) = calculate_metrics(
+        probabilities
     )
 
-    predicted_class = CLASSES[best_index]
+    predicted_class = CLASSES[
+        best_index
+    ]
 
     return {
         "status": "object_not_defined",
@@ -844,7 +887,7 @@ def result_from_probabilities(
         )
 
     (
-        best_index,
+        _best_index,
         confidence,
         margin,
         entropy,
@@ -878,9 +921,9 @@ def predict(
     Uses ONNX only.
     """
 
-    image = None
-    input_tensor = None
-    output = None
+    image: Image.Image | None = None
+    input_tensor: np.ndarray | None = None
+    output: np.ndarray | None = None
 
     try:
 
@@ -940,8 +983,8 @@ def predict(
 
     finally:
 
-        del input_tensor
-        del output
+        input_tensor = None
+        output = None
         image = None
 
         gc.collect()
@@ -958,7 +1001,7 @@ def find_last_conv_layer(
     Finds the last Conv2d layer.
     """
 
-    last_conv = None
+    last_conv: nn.Module | None = None
 
     for module in model.modules():
 
@@ -977,7 +1020,7 @@ def find_last_conv_layer(
 
 
 # ============================================================
-# GRAD-CAM
+# MEMORY-EFFICIENT FINAL-LAYER GRAD-CAM
 # ============================================================
 
 def generate_gradcam(
@@ -986,17 +1029,32 @@ def generate_gradcam(
     target_class: int,
 ) -> np.ndarray:
     """
-    Generates normalized Grad-CAM heatmap in [0, 1].
-    Output shape:
-        [IMG_SIZE, IMG_SIZE]
+    Memory-efficient final-layer Grad-CAM / CAM.
+
+    EfficientNet-B3 ends approximately as:
+
+        final convolution feature maps
+                ↓
+        global average pooling
+                ↓
+        classifier
+
+    Because the last convolution feeds a GAP + Linear classifier,
+    the class activation weighting can be computed directly from
+    the classifier weights.
+
+    This avoids a full autograd backward graph and dramatically
+    lowers CPU/RAM usage on Railway.
+
+    Returns:
+        heatmap in [0, 1] with shape [IMG_SIZE, IMG_SIZE]
     """
 
     target_layer = find_last_conv_layer(
         model
     )
 
-    activations: torch.Tensor | None = None
-    gradients: torch.Tensor | None = None
+    captured: dict[str, torch.Tensor] = {}
 
     def forward_hook(
         module: nn.Module,
@@ -1004,89 +1062,126 @@ def generate_gradcam(
         output: torch.Tensor,
     ) -> None:
 
-        nonlocal activations
+        # Detach immediately so the computation graph is not kept.
+        captured["activations"] = output.detach()
 
-        activations = output
-
-    def backward_hook(
-        module: nn.Module,
-        grad_input: tuple[Any, ...],
-        grad_output: tuple[Any, ...],
-    ) -> None:
-
-        nonlocal gradients
-
-        if grad_output and grad_output[0] is not None:
-            gradients = grad_output[0]
-
-    forward_handle = target_layer.register_forward_hook(
+    handle = target_layer.register_forward_hook(
         forward_hook
-    )
-
-    backward_handle = (
-        target_layer.register_full_backward_hook(
-            backward_hook
-        )
     )
 
     try:
 
-        model.zero_grad(
-            set_to_none=True
-        )
+        # ----------------------------------------------------
+        # Forward only: no autograd graph
+        # ----------------------------------------------------
 
-        with torch.enable_grad():
+        with torch.inference_mode():
 
             logits = model(
                 input_tensor
             )
 
-            if logits.ndim != 2:
+        if logits.ndim != 2:
+            raise RuntimeError(
+                f"Unexpected model output shape: "
+                f"{tuple(logits.shape)}"
+            )
+
+        if (
+            target_class < 0
+            or target_class >= logits.shape[1]
+        ):
+            raise ValueError(
+                f"Invalid target class: {target_class}"
+            )
+
+        if "activations" not in captured:
+            raise RuntimeError(
+                "Could not capture final convolution activations."
+            )
+
+        activations = captured[
+            "activations"
+        ]
+
+        # ----------------------------------------------------
+        # Find final Linear classifier
+        # ----------------------------------------------------
+
+        classifier_layer = model.classifier[1]
+
+        if isinstance(
+            classifier_layer,
+            nn.Sequential,
+        ):
+
+            linear_layer: nn.Linear | None = None
+
+            for module in classifier_layer.modules():
+
+                if isinstance(
+                    module,
+                    nn.Linear,
+                ):
+                    linear_layer = module
+
+            if linear_layer is None:
                 raise RuntimeError(
-                    f"Unexpected model output shape: "
-                    f"{tuple(logits.shape)}"
+                    "Could not find Linear layer "
+                    "inside classifier."
                 )
 
-            if target_class < 0 or target_class >= logits.shape[1]:
-                raise ValueError(
-                    f"Invalid target class: {target_class}"
-                )
+        elif isinstance(
+            classifier_layer,
+            nn.Linear,
+        ):
 
-            target_score = logits[
-                0,
-                target_class
-            ]
+            linear_layer = classifier_layer
 
-            target_score.backward()
+        else:
 
-        if activations is None:
             raise RuntimeError(
-                "Grad-CAM activations were not captured."
+                "Unsupported EfficientNet classifier architecture."
             )
 
-        if gradients is None:
-            raise RuntimeError(
-                "Grad-CAM gradients were not captured."
-            )
+        # ----------------------------------------------------
+        # Direct CAM weighting from classifier
+        # ----------------------------------------------------
 
-        # Global-average-pool gradients over spatial dimensions.
-        weights = gradients.mean(
-            dim=(2, 3),
-            keepdim=True,
-        )
+        class_weights = linear_layer.weight[
+            target_class
+        ].detach()
 
+        # activations:   [1, C, H, W]
+        # class_weights: [C]
         cam = (
-            weights * activations
+            activations[0]
+            * class_weights[:, None, None]
         ).sum(
-            dim=1,
-            keepdim=True,
+            dim=0
         )
 
-        cam = F.relu(cam)
+        # Positive evidence only.
+        cam = F.relu(
+            cam
+        )
+
+        # ----------------------------------------------------
+        # Resize heatmap
+        # ----------------------------------------------------
+
+        cam = cam.unsqueeze(
+            0
+        ).unsqueeze(
+            0
+        )
 
         cam = F.interpolate(
             cam,
-            size=(IMG_SIZE, IMG_SIZE),
+            size=(
+                IMG_SIZE,
+                IMG_SIZE,
+            ),
             mode="bilinear",
             align_corners=False,
         )
@@ -1095,28 +1190,37 @@ def generate_gradcam(
 
         cam = cam.detach().cpu().numpy()
 
-        # Normalize [0,1]
+        # ----------------------------------------------------
+        # Normalize to [0, 1]
+        # ----------------------------------------------------
+
         cam_min = float(
-            np.min(cam)
+            cam.min()
         )
 
         cam_max = float(
-            np.max(cam)
+            cam.max()
         )
 
-        if cam_max - cam_min > 1e-8:
+        if (
+            cam_max - cam_min
+            > 1e-8
+        ):
+
             cam = (
                 cam - cam_min
             ) / (
                 cam_max - cam_min
             )
+
         else:
+
             cam = np.zeros_like(
                 cam,
                 dtype=np.float32,
             )
 
-        cam = np.clip(
+        return np.clip(
             cam,
             0.0,
             1.0,
@@ -1124,16 +1228,20 @@ def generate_gradcam(
             np.float32
         )
 
-        return cam
-
     finally:
 
-        forward_handle.remove()
-        backward_handle.remove()
+        handle.remove()
 
-        model.zero_grad(
-            set_to_none=True
-        )
+        captured.clear()
+
+        try:
+            model.zero_grad(
+                set_to_none=True
+            )
+        except Exception:
+            pass
+
+        gc.collect()
 
 
 # ============================================================
@@ -1144,24 +1252,19 @@ def create_heatmap_image(
     cam: np.ndarray,
 ) -> Image.Image:
     """
-    Creates a color heatmap using PIL only.
+    Creates a heatmap using PIL/NumPy only.
     No OpenCV required.
     """
 
-    cam_uint8 = np.clip(
-        cam * 255.0,
-        0,
-        255,
+    x = np.clip(
+        cam,
+        0.0,
+        1.0,
     ).astype(
-        np.uint8
+        np.float32
     )
 
-    # Simple blue -> cyan -> yellow -> red style.
-    # Generated manually to avoid another heavy dependency.
-    x = cam_uint8.astype(
-        np.float32
-    ) / 255.0
-
+    # Blue -> Cyan -> Yellow -> Red.
     r = np.clip(
         4.0 * x - 1.5,
         0.0,
@@ -1169,7 +1272,10 @@ def create_heatmap_image(
     )
 
     g = np.clip(
-        4.0 * np.minimum(x, 1.0 - x),
+        4.0 * np.minimum(
+            x,
+            1.0 - x,
+        ),
         0.0,
         1.0,
     )
@@ -1211,7 +1317,7 @@ def create_overlay(
     alpha: float,
 ) -> Image.Image:
     """
-    Creates heatmap overlay at 300x300.
+    Creates heatmap overlay at model resolution.
     """
 
     alpha = float(
@@ -1268,7 +1374,7 @@ def image_to_base64(
 
 
 # ============================================================
-# EXPLAIN
+# EXPLAIN / GRAD-CAM
 # ============================================================
 
 def explain(
@@ -1280,16 +1386,12 @@ def explain(
     Production Grad-CAM pipeline.
 
     IMPORTANT:
-    /explain DOES NOT call predict() first.
-    It runs the PyTorch model exactly once, producing:
-      - prediction
-      - confidence
-      - OOD/rejection decision
-      - Grad-CAM
-      - overlay
-
-    This avoids loading ONNX + doing a second model inference
-    during the same explain request.
+    - /explain never calls /predict.
+    - ONNX memory is released first.
+    - PyTorch performs one forward pass only.
+    - No backward/autograd graph is built.
+    - Heatmap is computed from final-conv activations + classifier
+      weights.
     """
 
     image: Image.Image | None = None
@@ -1304,6 +1406,15 @@ def explain(
         try:
 
             print("[INFO] /explain started")
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Free ONNX before loading PyTorch.
+            # This avoids holding both models in RAM.
+            # ------------------------------------------------
+
+            unload_onnx_model()
+            gc.collect()
 
             # ------------------------------------------------
             # Load image
@@ -1333,44 +1444,39 @@ def explain(
             )
 
             # ------------------------------------------------
-            # Forward pass
+            # Prediction
             # ------------------------------------------------
 
-            model.zero_grad(
-                set_to_none=True
-            )
-
-            with torch.enable_grad():
+            with torch.inference_mode():
 
                 logits = model(
                     input_tensor
                 )
 
-            if logits.ndim != 2:
-                raise RuntimeError(
-                    f"Unexpected logits shape: "
-                    f"{tuple(logits.shape)}"
+                if logits.ndim != 2:
+                    raise RuntimeError(
+                        f"Unexpected logits shape: "
+                        f"{tuple(logits.shape)}"
+                    )
+
+                if logits.shape[1] != NUM_CLASSES:
+                    raise RuntimeError(
+                        f"PyTorch model returned "
+                        f"{logits.shape[1]} classes, "
+                        f"expected {NUM_CLASSES}."
+                    )
+
+                probabilities_tensor = torch.softmax(
+                    logits,
+                    dim=1,
+                )[0]
+
+                probabilities = (
+                    probabilities_tensor
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64)
                 )
-
-            if logits.shape[1] != NUM_CLASSES:
-                raise RuntimeError(
-                    f"PyTorch model returned "
-                    f"{logits.shape[1]} classes, "
-                    f"expected {NUM_CLASSES}."
-                )
-
-            probabilities_tensor = torch.softmax(
-                logits,
-                dim=1,
-            )[0]
-
-            probabilities = (
-                probabilities_tensor
-                .detach()
-                .cpu()
-                .numpy()
-                .astype(np.float64)
-            )
 
             # ------------------------------------------------
             # Prediction metrics
@@ -1419,9 +1525,11 @@ def explain(
             # ------------------------------------------------
 
             if target_class is None:
+
                 selected_class = best_index
 
             else:
+
                 selected_class = int(
                     target_class
                 )
@@ -1436,7 +1544,17 @@ def explain(
                     )
 
             # ------------------------------------------------
-            # Grad-CAM
+            # Free tiny forward tensors before CAM.
+            # Model stays loaded, input stays loaded.
+            # ------------------------------------------------
+
+            logits = None
+            probabilities_tensor = None
+
+            gc.collect()
+
+            # ------------------------------------------------
+            # Memory-efficient Grad-CAM
             # ------------------------------------------------
 
             print(
@@ -1502,13 +1620,7 @@ def explain(
                 "[INFO] Cleaning Grad-CAM resources..."
             )
 
-            # Destroy local tensors/resources.
-            try:
-                if input_tensor is not None:
-                    input_tensor.grad = None
-            except Exception:
-                pass
-
+            # Release local tensors/resources.
             input_tensor = None
             probabilities = None
             cam = None
@@ -1518,6 +1630,9 @@ def explain(
 
             # Release global model.
             unload_pytorch_model()
+
+            # Make sure ONNX is also not left around.
+            unload_onnx_model()
 
             gc.collect()
 
@@ -1551,7 +1666,7 @@ def get_model_info() -> dict[str, Any]:
         ),
         "gradcam": {
             "enabled": True,
-            "method": "Grad-CAM",
+            "method": "Memory-efficient final-layer Grad-CAM",
             "target_layer": "last Conv2d layer",
         },
         "ood_rejection": {
