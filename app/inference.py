@@ -4,6 +4,7 @@ import base64
 import gc
 import io
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,23 @@ import torch.nn as nn
 from torchvision import models, transforms
 
 import onnxruntime as ort
+
+
+# ============================================================
+# CPU / MEMORY SETTINGS
+# ============================================================
+
+# Railway normally runs CPU.
+# This also prevents PyTorch from trying to use unsupported
+# CPU optimizations such as NNPACK where possible.
+os.environ.setdefault("ATEN_CPU_CAPABILITY", "default")
+
+if not torch.cuda.is_available():
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -39,36 +57,39 @@ CLASS_NAMES_PATH = BASE_DIR / "class_names.json"
 IMG_SIZE = 300
 NUM_CLASSES = 5
 
-# Maximum uploaded file size in bytes.
-# 8 MB is more than enough for normal mobile images.
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-
-# Prevent PIL decompression bombs / extremely huge images.
 MAX_IMAGE_PIXELS = 20_000_000
 
-# ------------------------------------------------------------
+
+# ============================================================
 # OOD / REJECTION SETTINGS
-# ------------------------------------------------------------
+# ============================================================
 #
-# IMPORTANT:
-# These are rejection thresholds, NOT medical probabilities.
+# These are NOT medical probabilities.
 #
-# The model is allowed to say:
-#   object_not_defined
+# They determine whether the classifier is confident enough
+# to return a diagnosis.
 #
-# instead of forcing a disease prediction.
+# A prediction is rejected when:
 #
-# These values should eventually be calibrated using:
-#   1. Valid skin-lesion validation images
-#   2. External non-skin images
+#   confidence < MIN_CONFIDENCE
+#       OR
+#   margin < MIN_MARGIN
+#       OR
+#   entropy > MAX_ENTROPY
 #
-# Start conservative.
-# ------------------------------------------------------------
+# These values should ideally be calibrated using validation
+# and external non-skin images.
+# ============================================================
 
 MIN_CONFIDENCE = 0.70
 MIN_MARGIN = 0.15
 MAX_ENTROPY = 0.85
 
+
+# ============================================================
+# DEFAULT CLASSES
+# ============================================================
 
 CLASS_NAMES = [
     "akiec",
@@ -108,13 +129,9 @@ NORM_STD = [
 # DEVICE
 # ============================================================
 
-# Railway should normally use CPU.
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Keep PyTorch CPU memory / thread usage under control.
-if DEVICE.type == "cpu":
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 
 # ============================================================
@@ -165,6 +182,19 @@ if CLASS_NAMES_PATH.exists():
 
 
 # ============================================================
+# VALIDATE CLASS CONFIG
+# ============================================================
+
+if len(CLASS_NAMES) != NUM_CLASSES:
+
+    raise RuntimeError(
+        "CLASS_NAMES length does not match NUM_CLASSES. "
+        f"Got {len(CLASS_NAMES)} classes but "
+        f"NUM_CLASSES={NUM_CLASSES}."
+    )
+
+
+# ============================================================
 # PIL SAFETY
 # ============================================================
 
@@ -207,11 +237,10 @@ def create_onnx_session():
 
     session_options = ort.SessionOptions()
 
-    # Railway CPU optimization.
+    # Keep Railway CPU memory usage controlled.
     session_options.intra_op_num_threads = 1
     session_options.inter_op_num_threads = 1
 
-    # Reduce unnecessary graph memory.
     session_options.graph_optimization_level = (
         ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     )
@@ -219,7 +248,9 @@ def create_onnx_session():
     session = ort.InferenceSession(
         str(ONNX_MODEL_PATH),
         sess_options=session_options,
-        providers=["CPUExecutionProvider"],
+        providers=[
+            "CPUExecutionProvider"
+        ],
     )
 
     print(
@@ -236,9 +267,17 @@ def create_onnx_session():
     return session
 
 
-# IMPORTANT:
-# Only ONNX is loaded at startup.
+# ============================================================
+# LOAD ONNX ONCE
+# ============================================================
+
 SESSION = create_onnx_session()
+
+ONNX_INPUT_NAME = (
+    SESSION
+    .get_inputs()[0]
+    .name
+)
 
 
 # ============================================================
@@ -247,10 +286,17 @@ SESSION = create_onnx_session()
 
 PYTORCH_MODEL = None
 
-PYTORCH_MODEL_LOCK = threading.Lock()
+# Protect model loading/unloading and Grad-CAM execution.
+PYTORCH_MODEL_LOCK = threading.RLock()
 
 
-def build_pytorch_model():
+# ============================================================
+# BUILD EFFICIENTNET-B3
+# ============================================================
+
+def build_pytorch_model(
+    sequential_classifier: bool = False
+):
 
     print(
         "[INFO] Building EfficientNet-B3 "
@@ -265,16 +311,64 @@ def build_pytorch_model():
         model.classifier[1].in_features
     )
 
-    model.classifier[1] = nn.Sequential(
-        nn.Dropout(p=0.20),
-        nn.Linear(
+    # --------------------------------------------------------
+    # Support BOTH possible checkpoint architectures.
+    #
+    # Architecture A:
+    #
+    # classifier[1] = Linear(...)
+    #
+    # Keys:
+    # classifier.1.weight
+    # classifier.1.bias
+    #
+    # Architecture B:
+    #
+    # classifier[1] = Sequential(
+    #     Dropout,
+    #     Linear
+    # )
+    #
+    # Keys:
+    # classifier.1.1.weight
+    # classifier.1.1.bias
+    # --------------------------------------------------------
+
+    if sequential_classifier:
+
+        model.classifier[1] = nn.Sequential(
+            nn.Dropout(
+                p=0.20
+            ),
+            nn.Linear(
+                num_features,
+                NUM_CLASSES
+            )
+        )
+
+        print(
+            "[INFO] Using Sequential classifier "
+            "architecture."
+        )
+
+    else:
+
+        model.classifier[1] = nn.Linear(
             num_features,
             NUM_CLASSES
         )
-    )
+
+        print(
+            "[INFO] Using standard Linear "
+            "classifier architecture."
+        )
 
     return model
 
+
+# ============================================================
+# CHECKPOINT HELPERS
+# ============================================================
 
 def extract_state_dict(
     checkpoint: Any
@@ -283,14 +377,22 @@ def extract_state_dict(
     if isinstance(checkpoint, dict):
 
         if "state_dict" in checkpoint:
-            return checkpoint["state_dict"]
+
+            return checkpoint[
+                "state_dict"
+            ]
 
         if "model_state_dict" in checkpoint:
-            return checkpoint["model_state_dict"]
+
+            return checkpoint[
+                "model_state_dict"
+            ]
 
         if "model" in checkpoint:
 
-            model_value = checkpoint["model"]
+            model_value = checkpoint[
+                "model"
+            ]
 
             if isinstance(
                 model_value,
@@ -312,20 +414,44 @@ def clean_state_dict(
 
         new_key = key
 
-        if new_key.startswith("module."):
+        if new_key.startswith(
+            "module."
+        ):
 
             new_key = new_key[
-                len("module."):]
-            
-        if new_key.startswith("model."):
+                len("module."):
+            ]
+
+        if new_key.startswith(
+            "model."
+        ):
 
             new_key = new_key[
                 len("model."):]
-
+        
         cleaned[new_key] = value
 
     return cleaned
 
+
+def checkpoint_uses_sequential_classifier(
+    state_dict
+) -> bool:
+
+    for key in state_dict.keys():
+
+        if key.startswith(
+            "classifier.1.1."
+        ):
+
+            return True
+
+    return False
+
+
+# ============================================================
+# LOAD PYTORCH MODEL
+# ============================================================
 
 def load_pytorch_model():
 
@@ -333,7 +459,11 @@ def load_pytorch_model():
 
         print(
             "[WARN] PyTorch Grad-CAM model "
-            "not found."
+            "not found:"
+        )
+
+        print(
+            PYTORCH_MODEL_PATH
         )
 
         return None
@@ -342,7 +472,10 @@ def load_pytorch_model():
         "[INFO] Loading PyTorch Grad-CAM model..."
     )
 
-    model = build_pytorch_model()
+    # --------------------------------------------------------
+    # Load checkpoint first so we can detect the exact
+    # classifier architecture.
+    # --------------------------------------------------------
 
     checkpoint = torch.load(
         PYTORCH_MODEL_PATH,
@@ -367,6 +500,34 @@ def load_pytorch_model():
         state_dict
     )
 
+    sequential_classifier = (
+        checkpoint_uses_sequential_classifier(
+            state_dict
+        )
+    )
+
+    print(
+        "[INFO] Checkpoint classifier:",
+        (
+            "Sequential"
+            if sequential_classifier
+            else "Linear"
+        )
+    )
+
+    # --------------------------------------------------------
+    # Build matching architecture.
+    # --------------------------------------------------------
+
+    model = build_pytorch_model(
+        sequential_classifier=
+        sequential_classifier
+    )
+
+    # --------------------------------------------------------
+    # Load weights.
+    # --------------------------------------------------------
+
     missing, unexpected = (
         model.load_state_dict(
             state_dict,
@@ -374,49 +535,83 @@ def load_pytorch_model():
         )
     )
 
+    # We do NOT silently accept an incompatible model.
     if missing:
 
         print(
-            "[WARN] Missing keys:",
+            "[ERROR] Missing model keys:",
             len(missing)
+        )
+
+        print(
+            "[ERROR] First missing keys:",
+            missing[:20]
+        )
+
+        raise RuntimeError(
+            "PyTorch checkpoint is incompatible "
+            "with the EfficientNet-B3 architecture."
         )
 
     if unexpected:
 
         print(
-            "[WARN] Unexpected keys:",
+            "[ERROR] Unexpected model keys:",
             len(unexpected)
         )
 
-    model = model.to(DEVICE)
+        print(
+            "[ERROR] First unexpected keys:",
+            unexpected[:20]
+        )
+
+        raise RuntimeError(
+            "PyTorch checkpoint contains "
+            "unexpected model parameters."
+        )
+
+    # --------------------------------------------------------
+    # Move to device.
+    # --------------------------------------------------------
+
+    model = model.to(
+        DEVICE
+    )
 
     model.eval()
 
     print(
         f"[INFO] Grad-CAM model loaded "
-        f"on {DEVICE}"
+        f"successfully on {DEVICE}"
     )
 
     return model
 
 
+# ============================================================
+# GET / LOAD PYTORCH MODEL
+# ============================================================
+
 def get_or_load_pytorch_model():
 
     global PYTORCH_MODEL
 
-    if PYTORCH_MODEL is not None:
-        return PYTORCH_MODEL
-
     with PYTORCH_MODEL_LOCK:
 
-        if PYTORCH_MODEL is None:
+        if PYTORCH_MODEL is not None:
 
-            PYTORCH_MODEL = (
-                load_pytorch_model()
-            )
+            return PYTORCH_MODEL
 
-    return PYTORCH_MODEL
+        PYTORCH_MODEL = (
+            load_pytorch_model()
+        )
 
+        return PYTORCH_MODEL
+
+
+# ============================================================
+# UNLOAD PYTORCH MODEL
+# ============================================================
 
 def unload_pytorch_model():
 
@@ -427,17 +622,36 @@ def unload_pytorch_model():
         if PYTORCH_MODEL is not None:
 
             try:
-                PYTORCH_MODEL.cpu()
+
+                PYTORCH_MODEL.zero_grad(
+                    set_to_none=True
+                )
+
             except Exception:
+
                 pass
 
-            del PYTORCH_MODEL
+            try:
+
+                PYTORCH_MODEL.cpu()
+
+            except Exception:
+
+                pass
+
             PYTORCH_MODEL = None
 
     gc.collect()
 
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+
+        try:
+
+            torch.cuda.empty_cache()
+
+        except Exception:
+
+            pass
 
 
 # ============================================================
@@ -515,7 +729,11 @@ class GradCAM:
         grad_output
     ):
 
-        self.gradients = grad_output[0]
+        if grad_output:
+
+            self.gradients = (
+                grad_output[0]
+            )
 
     def remove_hooks(self):
 
@@ -544,25 +762,28 @@ class GradCAM:
         self.activations = None
         self.gradients = None
 
-        output = self.model(
-            input_tensor
-        )
+        # Grad-CAM requires gradients.
+        with torch.enable_grad():
 
-        if target_class is None:
-
-            target_class = int(
-                torch.argmax(
-                    output,
-                    dim=1
-                ).item()
+            output = self.model(
+                input_tensor
             )
 
-        score = output[
-            :,
-            target_class
-        ]
+            if target_class is None:
 
-        score.backward()
+                target_class = int(
+                    torch.argmax(
+                        output,
+                        dim=1
+                    ).item()
+                )
+
+            score = output[
+                0,
+                target_class
+            ]
+
+            score.backward()
 
         if self.activations is None:
 
@@ -578,9 +799,15 @@ class GradCAM:
                 "were not captured."
             )
 
-        activations = self.activations
-        gradients = self.gradients
+        activations = (
+            self.activations
+        )
 
+        gradients = (
+            self.gradients
+        )
+
+        # Global average pooling of gradients.
         weights = gradients.mean(
             dim=(2, 3),
             keepdim=True
@@ -593,34 +820,56 @@ class GradCAM:
             keepdim=True
         )
 
-        cam = torch.relu(cam)
+        cam = torch.relu(
+            cam
+        )
 
         cam = torch.nn.functional.interpolate(
             cam,
-            size=(IMG_SIZE, IMG_SIZE),
+            size=(
+                IMG_SIZE,
+                IMG_SIZE
+            ),
             mode="bilinear",
             align_corners=False
         )
 
-        cam = cam.squeeze()
+        cam = cam.squeeze(
+            0
+        ).squeeze(
+            0
+        )
 
         cam_min = cam.min()
         cam_max = cam.max()
 
-        cam = (
-            cam - cam_min
-        ) / (
+        denominator = (
             cam_max - cam_min + 1e-8
         )
 
-        return (
-            output.detach(),
+        cam = (
+            cam - cam_min
+        ) / denominator
+
+        # Detach everything returned from autograd.
+        output_cpu = (
+            output.detach()
+            .cpu()
+        )
+
+        cam_cpu = (
             cam.detach()
+            .cpu()
+        )
+
+        return (
+            output_cpu,
+            cam_cpu
         )
 
 
 # ============================================================
-# IMAGE UTILITIES
+# IMAGE LOADING
 # ============================================================
 
 def load_image(
@@ -642,16 +891,25 @@ def load_image(
 
     try:
 
-        image = Image.open(
+        # First verify the actual image.
+        with Image.open(
             io.BytesIO(image_bytes)
-        )
+        ) as verify_image:
 
-        # Verify before processing.
-        image.verify()
+            verify_image.verify()
 
-        image = Image.open(
+        # Re-open after verify because verify() invalidates
+        # the image object.
+        with Image.open(
             io.BytesIO(image_bytes)
-        ).convert("RGB")
+        ) as image:
+
+            image = image.convert(
+                "RGB"
+            )
+
+            # Copy so the BytesIO / PIL object can be released.
+            image = image.copy()
 
     except Exception as e:
 
@@ -662,6 +920,10 @@ def load_image(
     return image
 
 
+# ============================================================
+# IMAGE -> TENSOR
+# ============================================================
+
 def image_to_tensor(
     image: Image.Image
 ):
@@ -670,7 +932,9 @@ def image_to_tensor(
         image
     )
 
-    return tensor.unsqueeze(0)
+    return tensor.unsqueeze(
+        0
+    )
 
 
 # ============================================================
@@ -690,9 +954,11 @@ def softmax_numpy(
         )
     )
 
-    exp_logits = np.exp(logits)
+    exp_logits = np.exp(
+        logits
+    )
 
-    return (
+    probabilities = (
         exp_logits /
         np.sum(
             exp_logits,
@@ -700,6 +966,8 @@ def softmax_numpy(
             keepdims=True
         )
     )
+
+    return probabilities
 
 
 def calculate_entropy(
@@ -714,15 +982,17 @@ def calculate_entropy(
 
     entropy = -np.sum(
         probabilities *
-        np.log(probabilities)
+        np.log(
+            probabilities
+        )
     )
 
-    # Normalize entropy to 0..1.
     max_entropy = np.log(
         len(probabilities)
     )
 
     if max_entropy <= 0:
+
         return 0.0
 
     return float(
@@ -762,10 +1032,16 @@ def evaluate_prediction(
     )
 
     return {
-        "accepted": bool(accepted),
+        "accepted": bool(
+            accepted
+        ),
         "confidence": confidence,
-        "margin": float(margin),
-        "entropy": float(entropy),
+        "margin": float(
+            margin
+        ),
+        "entropy": float(
+            entropy
+        ),
     }
 
 
@@ -786,9 +1062,17 @@ def predict(
 
     try:
 
+        # ----------------------------------------------------
+        # Load image
+        # ----------------------------------------------------
+
         image = load_image(
             image_bytes
         )
+
+        # ----------------------------------------------------
+        # Preprocess
+        # ----------------------------------------------------
 
         tensor = image_to_tensor(
             image
@@ -796,22 +1080,29 @@ def predict(
 
         input_array = (
             tensor.numpy()
-            .astype(np.float32)
+            .astype(
+                np.float32,
+                copy=False
+            )
         )
 
-        input_name = (
-            SESSION
-            .get_inputs()[0]
-            .name
-        )
+        # ----------------------------------------------------
+        # ONNX inference
+        # ----------------------------------------------------
 
         outputs = SESSION.run(
             None,
             {
-                input_name:
+                ONNX_INPUT_NAME:
                 input_array
             }
         )
+
+        if not outputs:
+
+            raise RuntimeError(
+                "ONNX model returned no output."
+            )
 
         logits = np.asarray(
             outputs[0]
@@ -822,6 +1113,15 @@ def predict(
             logits = logits.reshape(
                 1,
                 -1
+            )
+
+        if logits.shape[1] != NUM_CLASSES:
+
+            raise RuntimeError(
+                "Model output class count "
+                f"({logits.shape[1]}) does not match "
+                f"configured NUM_CLASSES "
+                f"({NUM_CLASSES})."
             )
 
         probabilities = (
@@ -841,7 +1141,7 @@ def predict(
         )
 
         # ----------------------------------------------------
-        # REJECT UNKNOWN / OUT-OF-DOMAIN
+        # REJECT UNKNOWN / LOW-CONFIDENCE
         # ----------------------------------------------------
 
         if not quality["accepted"]:
@@ -851,16 +1151,45 @@ def predict(
                 "is_in_domain": False,
                 "diagnosis": None,
                 "class": None,
+
+                # This is the ACTUAL maximum model confidence.
+                # It is not fabricated.
                 "confidence": quality[
                     "confidence"
                 ],
+
                 "message": (
-                    "The uploaded image does not "
-                    "appear to be a sufficiently "
-                    "clear image for the trained "
-                    "skin-disease classifier."
-                )
+                    "The uploaded image is outside "
+                    "the supported domain or the "
+                    "model confidence is insufficient "
+                    "for a reliable prediction."
+                ),
+
+                "rejection": {
+                    "confidence": quality[
+                        "confidence"
+                    ],
+                    "margin": quality[
+                        "margin"
+                    ],
+                    "entropy": quality[
+                        "entropy"
+                    ],
+                }
             }
+
+        # ----------------------------------------------------
+        # ACCEPTED PREDICTION
+        # ----------------------------------------------------
+
+        if predicted_idx >= len(
+            CLASS_NAMES
+        ):
+
+            raise RuntimeError(
+                "Predicted class index is "
+                "outside CLASS_NAMES."
+            )
 
         predicted_class = (
             CLASS_NAMES[
@@ -878,8 +1207,13 @@ def predict(
         return {
             "status": "success",
             "is_in_domain": True,
+
+            # One diagnosis only.
             "diagnosis": predicted_label,
+
             "class": predicted_class,
+
+            # Actual probability from model.
             "confidence": quality[
                 "confidence"
             ]
@@ -891,33 +1225,49 @@ def predict(
         # MEMORY CLEANUP
         # ----------------------------------------------------
 
-        del image
-        del tensor
-        del input_array
-        del outputs
-        del logits
-        del probabilities
+        image = None
+        tensor = None
+        input_array = None
+        outputs = None
+        logits = None
+        probabilities = None
 
         gc.collect()
 
 
 # ============================================================
-# GRAD-CAM IMAGE CREATION
+# HEATMAP IMAGE
 # ============================================================
 
 def create_heatmap_image(
     cam
 ):
 
+    cam = np.asarray(
+        cam,
+        dtype=np.float32
+    )
+
+    cam = np.nan_to_num(
+        cam,
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0
+    )
+
+    cam = np.clip(
+        cam,
+        0.0,
+        1.0
+    )
+
     cam_uint8 = (
         cam * 255
-    ).clip(
-        0,
-        255
     ).astype(
         np.uint8
     )
 
+    # Simple RGB heatmap.
     r = cam_uint8
 
     g = np.clip(
@@ -950,6 +1300,10 @@ def create_heatmap_image(
     )
 
 
+# ============================================================
+# OVERLAY
+# ============================================================
+
 def create_overlay(
     original_image,
     heatmap_image,
@@ -962,9 +1316,12 @@ def create_overlay(
             (
                 IMG_SIZE,
                 IMG_SIZE
-            )
+            ),
+            Image.Resampling.BILINEAR
         )
-        .convert("RGB")
+        .convert(
+            "RGB"
+        )
     )
 
     return Image.blend(
@@ -974,22 +1331,36 @@ def create_overlay(
     )
 
 
+# ============================================================
+# IMAGE -> BASE64
+# ============================================================
+
 def pil_to_base64(
     image: Image.Image
 ):
 
     buffer = io.BytesIO()
 
-    image.save(
-        buffer,
-        format="JPEG",
-        quality=85,
-        optimize=True
-    )
+    try:
 
-    return base64.b64encode(
-        buffer.getvalue()
-    ).decode("utf-8")
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=80,
+            optimize=True
+        )
+
+        encoded = base64.b64encode(
+            buffer.getvalue()
+        ).decode(
+            "utf-8"
+        )
+
+        return encoded
+
+    finally:
+
+        buffer.close()
 
 
 # ============================================================
@@ -1002,10 +1373,13 @@ def explain(
     alpha: float = 0.45
 ):
 
-    # First perform normal ONNX prediction.
+    # --------------------------------------------------------
+    # FIRST:
+    # Run ONNX prediction.
     #
-    # This prevents loading the large PyTorch model
-    # when the image is already rejected.
+    # If rejected, we NEVER load the PyTorch model.
+    # --------------------------------------------------------
+
     prediction = predict(
         image_bytes
     )
@@ -1020,148 +1394,256 @@ def explain(
     target_layer = None
     logits = None
     cam = None
+    heatmap_image = None
+    overlay_image = None
+    overlay_base64 = None
 
-    model = get_or_load_pytorch_model()
+    # --------------------------------------------------------
+    # Lock the whole Grad-CAM operation.
+    #
+    # This prevents two requests from:
+    #
+    # Request A -> loading model
+    # Request B -> unloading model
+    #
+    # at the same time.
+    # --------------------------------------------------------
 
-    if model is None:
+    with PYTORCH_MODEL_LOCK:
 
-        raise RuntimeError(
-            "Grad-CAM model is unavailable."
-        )
-
-    try:
-
-        original_image = load_image(
-            image_bytes
-        )
-
-        input_tensor = (
-            image_to_tensor(
-                original_image
-            )
-            .to(DEVICE)
-        )
-
-        input_tensor.requires_grad_(True)
-
-        predicted_idx = (
-            CLASS_NAMES.index(
-                prediction["class"]
-            )
-        )
-
-        if target_class is None:
-
-            explained_idx = (
-                predicted_idx
-            )
-
-        else:
-
-            explained_idx = int(
-                target_class
-            )
-
-        if (
-            explained_idx < 0
-            or explained_idx >= NUM_CLASSES
-        ):
-
-            raise ValueError(
-                f"target_class must be "
-                f"between 0 and "
-                f"{NUM_CLASSES - 1}"
-            )
-
-        target_layer = (
-            get_gradcam_target_layer(
-                model
-            )
-        )
-
-        gradcam = GradCAM(
-            model,
-            target_layer
-        )
+        model = None
 
         try:
 
-            logits, cam = (
-                gradcam.generate(
-                    input_tensor,
-                    explained_idx
+            # ------------------------------------------------
+            # Load PyTorch model ONLY for explain.
+            # ------------------------------------------------
+
+            model = get_or_load_pytorch_model()
+
+            if model is None:
+
+                raise RuntimeError(
+                    "Grad-CAM model is unavailable."
+                )
+
+            # ------------------------------------------------
+            # Load original image.
+            # ------------------------------------------------
+
+            original_image = load_image(
+                image_bytes
+            )
+
+            # ------------------------------------------------
+            # Convert to tensor.
+            # ------------------------------------------------
+
+            input_tensor = (
+                image_to_tensor(
+                    original_image
+                )
+                .to(
+                    DEVICE
                 )
             )
 
-        finally:
-
-            gradcam.remove_hooks()
-
-        heatmap_image = (
-            create_heatmap_image(
-                cam.cpu().numpy()
+            input_tensor.requires_grad_(
+                True
             )
-        )
 
-        overlay_image = (
-            create_overlay(
-                original_image,
-                heatmap_image,
-                alpha=alpha
+            # ------------------------------------------------
+            # Determine class.
+            # ------------------------------------------------
+
+            predicted_idx = (
+                CLASS_NAMES.index(
+                    prediction["class"]
+                )
             )
-        )
 
-        return {
-            "status": "success",
-            "is_in_domain": True,
-            "diagnosis": prediction[
-                "diagnosis"
-            ],
-            "class": prediction[
-                "class"
-            ],
-            "confidence": prediction[
-                "confidence"
-            ],
-            "overlay_base64": (
+            if target_class is None:
+
+                explained_idx = (
+                    predicted_idx
+                )
+
+            else:
+
+                explained_idx = int(
+                    target_class
+                )
+
+            if (
+                explained_idx < 0
+                or explained_idx >= NUM_CLASSES
+            ):
+
+                raise ValueError(
+                    f"target_class must be "
+                    f"between 0 and "
+                    f"{NUM_CLASSES - 1}"
+                )
+
+            # ------------------------------------------------
+            # Target layer.
+            # ------------------------------------------------
+
+            target_layer = (
+                get_gradcam_target_layer(
+                    model
+                )
+            )
+
+            # ------------------------------------------------
+            # Grad-CAM.
+            # ------------------------------------------------
+
+            gradcam = GradCAM(
+                model,
+                target_layer
+            )
+
+            try:
+
+                logits, cam = (
+                    gradcam.generate(
+                        input_tensor,
+                        explained_idx
+                    )
+                )
+
+            finally:
+
+                gradcam.remove_hooks()
+
+            # ------------------------------------------------
+            # Create heatmap.
+            # ------------------------------------------------
+
+            heatmap_image = (
+                create_heatmap_image(
+                    cam.numpy()
+                )
+            )
+
+            # ------------------------------------------------
+            # Create overlay.
+            # ------------------------------------------------
+
+            overlay_image = (
+                create_overlay(
+                    original_image,
+                    heatmap_image,
+                    alpha=alpha
+                )
+            )
+
+            # ------------------------------------------------
+            # Convert overlay to Base64.
+            # ------------------------------------------------
+
+            overlay_base64 = (
                 pil_to_base64(
                     overlay_image
                 )
-            ),
-            "image_size": {
-                "width": IMG_SIZE,
-                "height": IMG_SIZE
-            },
-            "gradcam": {
-                "method": "Grad-CAM",
-                "target_layer": (
-                    "last Conv2d layer"
+            )
+
+            # ------------------------------------------------
+            # FINAL RESPONSE
+            # ------------------------------------------------
+
+            return {
+                "status": "success",
+                "is_in_domain": True,
+
+                "diagnosis": prediction[
+                    "diagnosis"
+                ],
+
+                "class": prediction[
+                    "class"
+                ],
+
+                "confidence": prediction[
+                    "confidence"
+                ],
+
+                "overlay_base64": (
+                    overlay_base64
                 ),
-                "alpha": float(alpha)
+
+                "image_size": {
+                    "width": IMG_SIZE,
+                    "height": IMG_SIZE
+                },
+
+                "gradcam": {
+                    "method": "Grad-CAM",
+                    "target_layer": (
+                        "last Conv2d layer"
+                    ),
+                    "alpha": float(
+                        alpha
+                    )
+                }
             }
-        }
 
-    finally:
+        finally:
 
-        if gradcam is not None:
+            # ------------------------------------------------
+            # Remove hooks.
+            # ------------------------------------------------
 
-            try:
-                gradcam.remove_hooks()
-            except Exception:
-                pass
+            if gradcam is not None:
 
-        del original_image
-        del input_tensor
-        del gradcam
-        del target_layer
-        del logits
-        del cam
+                try:
 
-        # VERY IMPORTANT:
-        # Free the PyTorch model after the request.
-        unload_pytorch_model()
+                    gradcam.remove_hooks()
 
-        gc.collect()
+                except Exception:
+
+                    pass
+
+            # ------------------------------------------------
+            # Clear PyTorch gradients.
+            # ------------------------------------------------
+
+            if model is not None:
+
+                try:
+
+                    model.zero_grad(
+                        set_to_none=True
+                    )
+
+                except Exception:
+
+                    pass
+
+            # ------------------------------------------------
+            # Release large objects.
+            # ------------------------------------------------
+
+            original_image = None
+            input_tensor = None
+            gradcam = None
+            target_layer = None
+            logits = None
+            cam = None
+            heatmap_image = None
+            overlay_image = None
+            overlay_base64 = None
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Unload PyTorch after EVERY explain request.
+            # ONNX remains loaded.
+            # ------------------------------------------------
+
+            unload_pytorch_model()
+
+            gc.collect()
 
 
 # ============================================================
@@ -1182,20 +1664,42 @@ def model_info():
 
         "labels": CLASS_LABELS,
 
-        "onnx_loaded": SESSION is not None,
+        "onnx_loaded": (
+            SESSION is not None
+        ),
 
-        # PyTorch should normally be false.
-        # It is loaded only during /explain.
         "gradcam_loaded": (
             PYTORCH_MODEL is not None
         ),
 
-        "device": str(DEVICE),
+        "device": str(
+            DEVICE
+        ),
 
         "ood": {
-            "min_confidence": MIN_CONFIDENCE,
-            "min_margin": MIN_MARGIN,
-            "max_entropy": MAX_ENTROPY
+
+            "min_confidence":
+                MIN_CONFIDENCE,
+
+            "min_margin":
+                MIN_MARGIN,
+
+            "max_entropy":
+                MAX_ENTROPY
+        },
+
+        "memory_policy": {
+
+            "onnx_persistent": True,
+
+            "pytorch_gradcam_persistent":
+                False,
+
+            "images_saved_to_server":
+                False,
+
+            "max_image_bytes":
+                MAX_IMAGE_BYTES
         },
 
         "gradcam_model": (
