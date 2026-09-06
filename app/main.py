@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
@@ -71,7 +72,7 @@ async def read_image_file(
     """
     Reads uploaded image into memory.
 
-    The API DOES NOT save the uploaded image to disk.
+    The API does not save the uploaded image to disk.
     """
 
     try:
@@ -82,9 +83,6 @@ async def read_image_file(
                 detail="Image filename is missing.",
             )
 
-        # Normal Flutter multipart uploads should use image/*
-        # but we don't reject unknown content-types here because
-        # some clients send application/octet-stream.
         content_type = (
             file.content_type or ""
         ).lower()
@@ -207,6 +205,18 @@ async def predict_endpoint(
             detail=str(e),
         ) from e
 
+    except FileNotFoundError as e:
+
+        logger.error(
+            "Required model file missing: %s",
+            str(e),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        ) from e
+
     except Exception as e:
 
         logger.error(
@@ -216,14 +226,11 @@ async def predict_endpoint(
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                f"Prediction failed: {str(e)}"
-            ),
+            detail=f"Prediction failed: {str(e)}",
         ) from e
 
     finally:
 
-        # Explicitly release the local reference.
         image_bytes = None
 
 
@@ -245,9 +252,7 @@ async def explain_endpoint(
         default=0.45,
         ge=0.10,
         le=0.85,
-        description=(
-            "Heatmap overlay opacity."
-        ),
+        description="Heatmap overlay opacity.",
     ),
 ):
     """
@@ -261,8 +266,8 @@ async def explain_endpoint(
         alpha
 
     Important:
-        This endpoint performs prediction + Grad-CAM
-        in ONE PyTorch pass.
+        Prediction + Grad-CAM are handled in one PyTorch pipeline.
+        ONNX is released first to reduce RAM pressure.
     """
 
     image_bytes = await read_image_file(
@@ -325,9 +330,7 @@ async def explain_endpoint(
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                f"Grad-CAM runtime error: {str(e)}"
-            ),
+            detail=f"Grad-CAM runtime error: {str(e)}",
         ) from e
 
     except Exception as e:
@@ -339,9 +342,7 @@ async def explain_endpoint(
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                f"Grad-CAM failed: {str(e)}"
-            ),
+            detail=f"Grad-CAM failed: {str(e)}",
         ) from e
 
     finally:
@@ -355,7 +356,6 @@ async def explain_endpoint(
 
 if __name__ == "__main__":
 
-    import os
     import uvicorn
 
     port = int(
