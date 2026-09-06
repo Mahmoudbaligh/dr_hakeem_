@@ -9,7 +9,7 @@
   "class_labels": {
     "akiec": "Actinic keratoses",
     "bcc": "Basal cell carcinoma",
-    "bkl": "Benign keratosis-like lesions ",
+    "bkl": "Benign keratosis-like lesions",
     "nv": "Melanocytic nevi",
     "mel": "Melanoma"
   },
