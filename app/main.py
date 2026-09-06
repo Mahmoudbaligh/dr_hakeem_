@@ -1,23 +1,36 @@
 from __future__ import annotations
 
-import gc
+import logging
 import traceback
 
-from fastapi import (
-    FastAPI,
-    File,
-    UploadFile,
-    HTTPException,
-    Query,
-)
-
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from .inference import (
-    predict,
-    explain,
-    model_info,
+from app.inference import (
     MAX_IMAGE_BYTES,
+    explain,
+    get_model_info,
+    health_check,
+    predict,
+)
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
+)
+
+logger = logging.getLogger(
+    "dr-hakeem-api"
 )
 
 
@@ -28,10 +41,10 @@ from .inference import (
 app = FastAPI(
     title="Dr. Hakeem AI API",
     description=(
-        "AI-powered skin disease classification "
-        "with ONNX inference and Grad-CAM explainability."
+        "AI-powered skin lesion classification "
+        "and Grad-CAM explainability API."
     ),
-    version="3.1.0",
+    version="1.0.0",
 )
 
 
@@ -42,10 +55,73 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+async def read_image_file(
+    file: UploadFile,
+) -> bytes:
+    """
+    Reads uploaded image into memory.
+
+    The API DOES NOT save the uploaded image to disk.
+    """
+
+    try:
+
+        if not file.filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Image filename is missing.",
+            )
+
+        # Normal Flutter multipart uploads should use image/*
+        # but we don't reject unknown content-types here because
+        # some clients send application/octet-stream.
+        content_type = (
+            file.content_type or ""
+        ).lower()
+
+        logger.info(
+            "Incoming file: name=%s content_type=%s",
+            file.filename,
+            content_type,
+        )
+
+        content = await file.read(
+            MAX_IMAGE_BYTES + 1
+        )
+
+        if not content:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty.",
+            )
+
+        if len(content) > MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Image is too large. "
+                    "Maximum size is 8 MB."
+                ),
+            )
+
+        return content
+
+    finally:
+
+        try:
+            await file.close()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -54,19 +130,13 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-
     return {
-        "name": "Dr. Hakeem AI API",
-        "status": "online",
-        "version": "3.1.0",
-
-        "endpoints": {
-            "health": "/health",
-            "predict": "/predict",
-            "explain": "/explain",
-            "model_info": "/model-info",
-            "docs": "/docs",
-        }
+        "service": "Dr. Hakeem AI API",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/health",
+        "predict": "/predict",
+        "explain": "/explain",
     }
 
 
@@ -76,24 +146,7 @@ def root():
 
 @app.get("/health")
 def health():
-
-    info = model_info()
-
-    return {
-        "status": "healthy",
-
-        "onnx_loaded": info[
-            "onnx_loaded"
-        ],
-
-        "gradcam_loaded": info[
-            "gradcam_loaded"
-        ],
-
-        "device": info[
-            "device"
-        ],
-    }
+    return health_check()
 
 
 # ============================================================
@@ -101,75 +154,8 @@ def health():
 # ============================================================
 
 @app.get("/model-info")
-def get_model_info():
-
-    return model_info()
-
-
-# ============================================================
-# READ IMAGE SAFELY
-# ============================================================
-
-async def read_image_file(
-    file: UploadFile
-):
-
-    if not file.content_type:
-
-        raise HTTPException(
-            status_code=400,
-            detail="File type is missing."
-        )
-
-    if not file.content_type.startswith(
-        "image/"
-    ):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload an image."
-        )
-
-    image_bytes = None
-
-    try:
-
-        image_bytes = await file.read()
-
-        if not image_bytes:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Empty image."
-            )
-
-        if len(image_bytes) > MAX_IMAGE_BYTES:
-
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    "Image is too large. "
-                    "Maximum size is 8 MB."
-                )
-            )
-
-        return image_bytes
-
-    except HTTPException:
-
-        raise
-
-    except Exception as e:
-
-        print(
-            f"[ERROR] Reading uploaded image failed: "
-            f"{repr(e)}"
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Could not read uploaded image."
-        )
+def model_info():
+    return get_model_info()
 
 
 # ============================================================
@@ -178,86 +164,67 @@ async def read_image_file(
 
 @app.post("/predict")
 async def predict_endpoint(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
 ):
+    """
+    Standard classification endpoint.
 
-    image_bytes = None
+    Multipart field:
+        file
+
+    Returns one best prediction or object_not_defined.
+    """
+
+    image_bytes = await read_image_file(
+        file
+    )
 
     try:
 
-        # ----------------------------------------------------
-        # Read image into memory only.
-        # Nothing is saved to disk.
-        # ----------------------------------------------------
-
-        image_bytes = await read_image_file(
-            file
+        logger.info(
+            "Starting /predict request."
         )
-
-        # ----------------------------------------------------
-        # AI prediction.
-        # ----------------------------------------------------
 
         result = predict(
             image_bytes
         )
 
+        logger.info(
+            "Finished /predict successfully."
+        )
+
         return result
-
-    except HTTPException:
-
-        raise
 
     except ValueError as e:
 
-        print(
-            f"[WARN] Invalid prediction input: "
-            f"{repr(e)}"
+        logger.warning(
+            "Prediction validation error: %s",
+            str(e),
         )
 
         raise HTTPException(
             status_code=400,
-            detail=str(e)
-        )
+            detail=str(e),
+        ) from e
 
     except Exception as e:
 
-        print(
-            "[ERROR] Prediction failed:"
+        logger.error(
+            "PREDICT FAILED:\n%s",
+            traceback.format_exc(),
         )
-
-        print(
-            repr(e)
-        )
-
-        traceback.print_exc()
 
         raise HTTPException(
             status_code=500,
-            detail="Prediction failed."
-        )
+            detail=(
+                f"Prediction failed: {str(e)}"
+            ),
+        ) from e
 
     finally:
 
-        # ----------------------------------------------------
-        # Close UploadFile.
-        # ----------------------------------------------------
-
-        try:
-
-            await file.close()
-
-        except Exception:
-
-            pass
-
-        # ----------------------------------------------------
-        # Release image bytes.
-        # ----------------------------------------------------
-
+        # Explicitly release the local reference.
         image_bytes = None
-
-        gc.collect()
 
 
 # ============================================================
@@ -266,44 +233,50 @@ async def predict_endpoint(
 
 @app.post("/explain")
 async def explain_endpoint(
-
     file: UploadFile = File(...),
-
     target_class: int | None = Query(
         default=None,
-        ge=0,
-        le=4,
         description=(
-            "Optional class index to explain. "
-            "If omitted, the predicted class is explained."
-        )
+            "Optional class index for Grad-CAM. "
+            "If omitted, the predicted class is used."
+        ),
     ),
-
     alpha: float = Query(
         default=0.45,
-        ge=0.0,
-        le=1.0,
+        ge=0.10,
+        le=0.85,
         description=(
-            "Heatmap overlay strength."
-        )
+            "Heatmap overlay opacity."
+        ),
     ),
 ):
+    """
+    Grad-CAM explainability endpoint.
 
-    image_bytes = None
+    Multipart field:
+        file
+
+    Optional:
+        target_class
+        alpha
+
+    Important:
+        This endpoint performs prediction + Grad-CAM
+        in ONE PyTorch pass.
+    """
+
+    image_bytes = await read_image_file(
+        file
+    )
 
     try:
 
-        # ----------------------------------------------------
-        # Read image.
-        # ----------------------------------------------------
-
-        image_bytes = await read_image_file(
-            file
+        logger.info(
+            "Starting /explain request | "
+            "target_class=%s | alpha=%s",
+            target_class,
+            alpha,
         )
-
-        # ----------------------------------------------------
-        # Run Grad-CAM.
-        # ----------------------------------------------------
 
         result = explain(
             image_bytes=image_bytes,
@@ -311,85 +284,90 @@ async def explain_endpoint(
             alpha=alpha,
         )
 
+        logger.info(
+            "Finished /explain request | "
+            "status=%s",
+            result.get("status"),
+        )
+
         return result
-
-    except HTTPException:
-
-        raise
 
     except ValueError as e:
 
-        print(
-            "[WARN] Invalid Grad-CAM input:"
-        )
-
-        print(
-            repr(e)
+        logger.warning(
+            "Explain validation error: %s",
+            str(e),
         )
 
         raise HTTPException(
             status_code=400,
-            detail=str(e)
+            detail=str(e),
+        ) from e
+
+    except FileNotFoundError as e:
+
+        logger.error(
+            "Required model file missing: %s",
+            str(e),
         )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        ) from e
+
+    except RuntimeError as e:
+
+        logger.error(
+            "GRAD-CAM RUNTIME ERROR:\n%s",
+            traceback.format_exc(),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Grad-CAM runtime error: {str(e)}"
+            ),
+        ) from e
 
     except Exception as e:
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # Print the REAL error to Railway logs.
-        # ----------------------------------------------------
-
-        print(
-            "=================================================="
+        logger.error(
+            "GRAD-CAM FAILED:\n%s",
+            traceback.format_exc(),
         )
 
-        print(
-            "[ERROR] GRAD-CAM FAILED"
-        )
-
-        print(
-            f"Exception type: {type(e).__name__}"
-        )
-
-        print(
-            f"Exception: {repr(e)}"
-        )
-
-        traceback.print_exc()
-
-        print(
-            "=================================================="
-        )
-
-        # During development / debugging, returning the real
-        # message makes it much easier to diagnose the issue.
-        #
-        # The full traceback remains server-side only.
         raise HTTPException(
             status_code=500,
             detail=(
                 f"Grad-CAM failed: {str(e)}"
-            )
-        )
+            ),
+        ) from e
 
     finally:
 
-        # ----------------------------------------------------
-        # Close UploadFile.
-        # ----------------------------------------------------
-
-        try:
-
-            await file.close()
-
-        except Exception:
-
-            pass
-
-        # ----------------------------------------------------
-        # Release image bytes.
-        # ----------------------------------------------------
-
         image_bytes = None
 
-        gc.collect()
+
+# ============================================================
+# LOCAL ENTRYPOINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    import os
+    import uvicorn
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "8000",
+        )
+    )
+
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=port,
+        workers=1,
+    )
