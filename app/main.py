@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+import gc
+import traceback
+
 from fastapi import (
     FastAPI,
     File,
@@ -26,7 +31,7 @@ app = FastAPI(
         "AI-powered skin disease classification "
         "with ONNX inference and Grad-CAM explainability."
     ),
-    version="3.0.0",
+    version="3.1.0",
 )
 
 
@@ -53,7 +58,8 @@ def root():
     return {
         "name": "Dr. Hakeem AI API",
         "status": "online",
-        "version": "3.0.0",
+        "version": "3.1.0",
+
         "endpoints": {
             "health": "/health",
             "predict": "/predict",
@@ -75,12 +81,15 @@ def health():
 
     return {
         "status": "healthy",
+
         "onnx_loaded": info[
             "onnx_loaded"
         ],
+
         "gradcam_loaded": info[
             "gradcam_loaded"
         ],
+
         "device": info[
             "device"
         ],
@@ -121,26 +130,46 @@ async def read_image_file(
             detail="Please upload an image."
         )
 
-    image_bytes = await file.read()
+    image_bytes = None
 
-    if not image_bytes:
+    try:
+
+        image_bytes = await file.read()
+
+        if not image_bytes:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Empty image."
+            )
+
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Image is too large. "
+                    "Maximum size is 8 MB."
+                )
+            )
+
+        return image_bytes
+
+    except HTTPException:
+
+        raise
+
+    except Exception as e:
+
+        print(
+            f"[ERROR] Reading uploaded image failed: "
+            f"{repr(e)}"
+        )
 
         raise HTTPException(
             status_code=400,
-            detail="Empty image."
+            detail="Could not read uploaded image."
         )
-
-    if len(image_bytes) > MAX_IMAGE_BYTES:
-
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                "Image is too large. "
-                "Maximum size is 8 MB."
-            )
-        )
-
-    return image_bytes
 
 
 # ============================================================
@@ -152,11 +181,22 @@ async def predict_endpoint(
     file: UploadFile = File(...)
 ):
 
+    image_bytes = None
+
     try:
+
+        # ----------------------------------------------------
+        # Read image into memory only.
+        # Nothing is saved to disk.
+        # ----------------------------------------------------
 
         image_bytes = await read_image_file(
             file
         )
+
+        # ----------------------------------------------------
+        # AI prediction.
+        # ----------------------------------------------------
 
         result = predict(
             image_bytes
@@ -170,6 +210,11 @@ async def predict_endpoint(
 
     except ValueError as e:
 
+        print(
+            f"[WARN] Invalid prediction input: "
+            f"{repr(e)}"
+        )
+
         raise HTTPException(
             status_code=400,
             detail=str(e)
@@ -178,8 +223,14 @@ async def predict_endpoint(
     except Exception as e:
 
         print(
-            f"[ERROR] Prediction failed: {e}"
+            "[ERROR] Prediction failed:"
         )
+
+        print(
+            repr(e)
+        )
+
+        traceback.print_exc()
 
         raise HTTPException(
             status_code=500,
@@ -188,11 +239,25 @@ async def predict_endpoint(
 
     finally:
 
-        # Do not retain uploaded image.
+        # ----------------------------------------------------
+        # Close UploadFile.
+        # ----------------------------------------------------
+
         try:
-            del image_bytes
+
+            await file.close()
+
         except Exception:
+
             pass
+
+        # ----------------------------------------------------
+        # Release image bytes.
+        # ----------------------------------------------------
+
+        image_bytes = None
+
+        gc.collect()
 
 
 # ============================================================
@@ -224,11 +289,21 @@ async def explain_endpoint(
     ),
 ):
 
+    image_bytes = None
+
     try:
+
+        # ----------------------------------------------------
+        # Read image.
+        # ----------------------------------------------------
 
         image_bytes = await read_image_file(
             file
         )
+
+        # ----------------------------------------------------
+        # Run Grad-CAM.
+        # ----------------------------------------------------
 
         result = explain(
             image_bytes=image_bytes,
@@ -244,6 +319,14 @@ async def explain_endpoint(
 
     except ValueError as e:
 
+        print(
+            "[WARN] Invalid Grad-CAM input:"
+        )
+
+        print(
+            repr(e)
+        )
+
         raise HTTPException(
             status_code=400,
             detail=str(e)
@@ -251,18 +334,62 @@ async def explain_endpoint(
 
     except Exception as e:
 
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Print the REAL error to Railway logs.
+        # ----------------------------------------------------
+
         print(
-            f"[ERROR] Grad-CAM failed: {e}"
+            "=================================================="
         )
 
+        print(
+            "[ERROR] GRAD-CAM FAILED"
+        )
+
+        print(
+            f"Exception type: {type(e).__name__}"
+        )
+
+        print(
+            f"Exception: {repr(e)}"
+        )
+
+        traceback.print_exc()
+
+        print(
+            "=================================================="
+        )
+
+        # During development / debugging, returning the real
+        # message makes it much easier to diagnose the issue.
+        #
+        # The full traceback remains server-side only.
         raise HTTPException(
             status_code=500,
-            detail="Grad-CAM failed."
+            detail=(
+                f"Grad-CAM failed: {str(e)}"
+            )
         )
 
     finally:
 
+        # ----------------------------------------------------
+        # Close UploadFile.
+        # ----------------------------------------------------
+
         try:
-            del image_bytes
+
+            await file.close()
+
         except Exception:
+
             pass
+
+        # ----------------------------------------------------
+        # Release image bytes.
+        # ----------------------------------------------------
+
+        image_bytes = None
+
+        gc.collect()
