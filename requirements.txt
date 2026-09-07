@@ -6,3 +6,4 @@ Pillow
 onnxruntime
 torch
 torchvision
+google-generativeai

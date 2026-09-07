@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+app/__pycache__/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment variables & Secrets
+.env
+.env.*
+secrets.toml
+.streamlit/secrets.toml
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs & Temporary files
+*.log
+scratch/

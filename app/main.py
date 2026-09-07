@@ -8,11 +8,34 @@ from fastapi import (
 
 from fastapi.middleware.cors import CORSMiddleware
 
-from .inference import (
-    predict,
-    explain,
-    model_info,
-)
+import sys
+from pathlib import Path
+
+# Ensure root directory is in sys.path when running main.py directly
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+try:
+    from .inference import (
+        predict,
+        explain,
+        model_info,
+        load_image,
+        pil_to_base64,
+        IMG_SIZE,
+    )
+    from .gemini_service import check_image_with_gemini
+except ImportError:
+    from app.inference import (
+        predict,
+        explain,
+        model_info,
+        load_image,
+        pil_to_base64,
+        IMG_SIZE,
+    )
+    from app.gemini_service import check_image_with_gemini
 
 
 # ============================================================
@@ -125,6 +148,45 @@ async def predict_endpoint(
                 detail="Empty image."
             )
 
+        gemini_result = check_image_with_gemini(image_bytes)
+        
+        if gemini_result == "NOT_SKIN":
+            return {
+                "success": True,
+                "filename": file.filename,
+                "predicted_class": "not_skin",
+                "predicted_label": "Not a skin image",
+                "confidence": 1.0,
+                "top_predictions": [
+                    {
+                        "class": "not_skin",
+                        "label": "Not a skin image",
+                        "confidence": 1.0
+                    }
+                ],
+                "status": "not_skin",
+                "message": "The image is not a skin image."
+            }
+            
+        elif gemini_result == "HEALTHY":
+            return {
+                "success": True,
+                "filename": file.filename,
+                "predicted_class": "healthy",
+                "predicted_label": "Healthy skin",
+                "confidence": 1.0,
+                "top_predictions": [
+                    {
+                        "class": "healthy",
+                        "label": "Healthy skin",
+                        "confidence": 1.0
+                    }
+                ],
+                "status": "healthy",
+                "message": "The skin appears healthy."
+            }
+            
+        # Fallback to the custom model if it's a disease or error
         result = predict(
             image_bytes
         )
@@ -132,6 +194,7 @@ async def predict_endpoint(
         return {
             "success": True,
             "filename": file.filename,
+            "status": "disease",
             **result
         }
 
@@ -200,6 +263,76 @@ async def explain_endpoint(
                 detail="Empty image."
             )
 
+        gemini_result = check_image_with_gemini(image_bytes)
+        
+        if gemini_result == "NOT_SKIN":
+            raw_img = load_image(image_bytes)
+            img_b64 = pil_to_base64(raw_img)
+            return {
+                "success": True,
+                "filename": file.filename,
+                "predicted_class": "not_skin",
+                "predicted_label": "Not a skin image",
+                "confidence": 1.0,
+                "explained_class": "not_skin",
+                "explained_label": "Not a skin image",
+                "explained_class_confidence": 1.0,
+                "top_predictions": [
+                    {
+                        "class": "not_skin",
+                        "label": "Not a skin image",
+                        "confidence": 1.0
+                    }
+                ],
+                "heatmap_base64": img_b64,
+                "overlay_base64": img_b64,
+                "image_size": {
+                    "width": IMG_SIZE,
+                    "height": IMG_SIZE
+                },
+                "gradcam": {
+                    "method": "Grad-CAM",
+                    "target_layer": "N/A",
+                    "alpha": float(alpha)
+                },
+                "status": "not_skin",
+                "message": "The image is not a skin image."
+            }
+            
+        elif gemini_result == "HEALTHY":
+            raw_img = load_image(image_bytes)
+            img_b64 = pil_to_base64(raw_img)
+            return {
+                "success": True,
+                "filename": file.filename,
+                "predicted_class": "healthy",
+                "predicted_label": "Healthy skin",
+                "confidence": 1.0,
+                "explained_class": "healthy",
+                "explained_label": "Healthy skin",
+                "explained_class_confidence": 1.0,
+                "top_predictions": [
+                    {
+                        "class": "healthy",
+                        "label": "Healthy skin",
+                        "confidence": 1.0
+                    }
+                ],
+                "heatmap_base64": img_b64,
+                "overlay_base64": img_b64,
+                "image_size": {
+                    "width": IMG_SIZE,
+                    "height": IMG_SIZE
+                },
+                "gradcam": {
+                    "method": "Grad-CAM",
+                    "target_layer": "N/A",
+                    "alpha": float(alpha)
+                },
+                "status": "healthy",
+                "message": "The skin appears healthy."
+            }
+
         result = explain(
             image_bytes=image_bytes,
             target_class=target_class,
@@ -209,6 +342,7 @@ async def explain_endpoint(
         return {
             "success": True,
             "filename": file.filename,
+            "status": "disease",
             **result
         }
 
@@ -228,3 +362,8 @@ async def explain_endpoint(
             status_code=500,
             detail=f"Grad-CAM failed: {str(e)}"
         )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
